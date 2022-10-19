@@ -10,6 +10,8 @@ __email__ = 'jan.tomsa@showmax.com'
 __date__ = '2019/03/22'
 __version__ = '0.0.1'
 
+import os
+
 from dateutil.parser import parse
 from collections import defaultdict
 from prometheus_client.core import (
@@ -32,10 +34,11 @@ logger = logging.getLogger('patroni-exporter')
 
 
 class PatroniCollector:
-    def __init__(self, url: str, timeout: int, verify: str):
-        self.url = url
+    def __init__(self, base_url: str, timeout: int, verify: str):
+        self.base_url = base_url
         self.scrape = {}
-        self.data: defaultdict[str, Dict[str, Union[str, int, List]]]\
+        self.cluster_scrape = {}
+        self.data: defaultdict[str, Dict[str, Union[str, int, List]]] \
             = defaultdict(dict)
         self.timeout = timeout
         self.requests_verify = next(map(
@@ -51,9 +54,9 @@ class PatroniCollector:
 
         :return:
         """
-        logger.debug(f'Scraping Patroni API at {self.url}.')
+        logger.debug(f'Scraping Patroni API at {self.base_url}/patroni.')
         try:
-            r = requests.get(self.url, timeout=self.timeout,
+            r = requests.get(f'{self.base_url}/patroni', timeout=self.timeout,
                              verify=self.requests_verify)
             self.scrape = r.json()
             if not self.scrape.get('role') == 'replica':
@@ -62,7 +65,27 @@ class PatroniCollector:
         except Exception as e:
             self.status = '503 Service Unavailable'
             self.scrape = {}
-            logger.error(f'Scraping of Patroni @ {self.url} failed: {e}')
+            logger.error(f'Scraping of Patroni @ {self.base_url} failed: {e}')
+        logger.debug(f'Scraped data: {self.scrape}')
+
+    def scrape_cluster(self) -> None:
+        """
+        Read information from patroni cluster API
+
+        :return:
+        """
+        logger.debug(f'Scraping Patroni Cluster API at {self.base_url}/cluster')
+        try:
+            r = requests.get(f'{self.base_url}/cluster', timeout=self.timeout,
+                             verify=self.requests_verify)
+            self.cluster_scrape = r.json()
+            if not self.cluster_scrape.get('members'):
+                r.raise_for_status()
+            self.status = '200 OK'
+        except Exception as e:
+            self.status = '503 Service Unavailable'
+            self.scrape = {}
+            logger.error(f'Scraping of Patroni @ {self.base_url} failed: {e}')
         logger.debug(f'Scraped data: {self.scrape}')
 
     @staticmethod
@@ -71,6 +94,10 @@ class PatroniCollector:
         return int(parse(timestring).strftime('%s'))
 
     def preprocessing(self) -> None:
+        self.process_patroni()
+        self.process_cluster()
+
+    def process_patroni(self) -> None:
         """
         Group data from Patroni into logical blocks
         :return:
@@ -145,6 +172,35 @@ class PatroniCollector:
             logger.warning(f'Not all metrics '
                            f'has been preprocessed: {self.scrape}')
 
+    def process_cluster(self):
+        if not self.cluster_scrape:
+            return
+
+        try:
+            my_name = os.environ['HOSTNAME']
+        except KeyError:
+            logger.error("HOSTNAME not set. Will not process cluster data.")
+            return
+
+        members = self.cluster_scrape.get("members")
+
+        my_member = None
+
+        # Find myself
+        for member in members:
+            if member.get("name") == my_name:
+                my_member = member
+
+        if not my_member:
+            logger.error(f'Did not find myself ({my_name}).')
+            return
+
+        self.data["cluster_gauge"]["leader"] = 1 if my_member.get("role") == "leader" else 0
+        self.data["cluster_gauge"]["state"] = 1 if my_member.get("state") == "running" else 0
+        self.data["cluster_gauge"]["lag"] = my_member.get("lag") if my_member.get("lag") else 0
+
+        logger.debug(f'Preprocessed data: {self.data}')
+
     @staticmethod
     def _process_gauge(data: Dict, label: str) -> List[GaugeMetricFamily]:
         metrics = []
@@ -193,6 +249,7 @@ class PatroniCollector:
            It is used by the prometheus_client library
         """
         self.scrape_patroni()
+        self.scrape_cluster()
         self.preprocessing()
 
         sections = self.process_data()
@@ -220,6 +277,7 @@ class PatroniExporter:
         - it is possible when using AF_INET6 with binding to '' or '::'
         :return:
         """
+
         class ServerClass(WSGIServer):
             address_family = getattr(socket, self.cmdline.address_family)
 
@@ -239,7 +297,7 @@ class PatroniExporter:
                             help='Interface to listen at')
         parser.add_argument('-u', '--patroni-url',
                             dest='url',
-                            default=environ.get('PATRONI_EXPORTER_URL', 'http://localhost:8008/patroni'),
+                            default=environ.get('PATRONI_EXPORTER_URL', 'http://localhost:8008'),
                             help='Patroni API url '
                                  'where to send GET requests to')
         parser.add_argument('-d', '--debug',
@@ -266,7 +324,7 @@ class PatroniExporter:
                                     TLS certificate, or a path
                                     to a CA bundle to use. 
                                     Defaults to ``true``""")
-        parser.add_argument('--tls', 
+        parser.add_argument('--tls',
                             dest='tls',
                             action='store_true',
                             default=environ.get('PATRONI_EXPORTER_TLS', False),
@@ -325,9 +383,9 @@ class PatroniExporter:
                             self.get_server_class())
         if self.cmdline.tls:
             import ssl
-            httpd.socket = ssl.wrap_socket(httpd.socket, 
-                    certfile=self.cmdline.tls_cert, keyfile=self.cmdline.tls_key, 
-                    server_side=True)
+            httpd.socket = ssl.wrap_socket(httpd.socket,
+                                           certfile=self.cmdline.tls_cert, keyfile=self.cmdline.tls_key,
+                                           server_side=True)
         httpd.serve_forever()
 
 
